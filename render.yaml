@@ -1,0 +1,57 @@
+# Render Blueprint: creates one free web service per region.
+# All services share the same TOKEN (env group). Delete regions you don't want.
+# NOTE: free instances share 750 instance-hours/month across your workspace,
+# but a service only consumes hours while awake (it sleeps ~15 min after
+# its last inbound traffic).
+envVarGroups:
+  - name: vpn-shared
+    envVars:
+      - key: TOKEN
+        generateValue: true
+      - key: MAX_SESSION_HOURS
+        value: "3"
+      - key: IDLE_MINUTES
+        value: "20"
+
+services:
+  - type: web
+    name: vpn-oregon
+    runtime: node
+    region: oregon
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: vpn-shared
+      - key: REGION_LABEL
+        value: Oregon
+
+  - type: web
+    name: vpn-virginia
+    runtime: node
+    region: virginia
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: vpn-shared
+      - key: REGION_LABEL
+        value: Virginia
+
+  - type: web
+    name: vpn-frankfurt
+    runtime: node
+    region: frankfurt
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - fromGroup: vpn-shared
+      - key: REGION_LABEL
+        value: Frankfurt
