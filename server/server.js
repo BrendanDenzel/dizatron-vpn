@@ -2,17 +2,17 @@
 /**
  * Render tunnel server.
  *
- * Transports (all ride on Render's HTTPS/WSS on port 443, or HTTP on port 80):
- *   1. HTTP CONNECT proxy      -> used directly by Chrome (chrome.proxy API)
- *   2. Plain HTTP forward proxy -> same, for http:// sites
- *   3. WebSocket tunnel (/ws)  -> used by the optional local client when CONNECT
- *                                 is blocked by the network or edge
+ * Transports:
+ *   1. WebSocket tunnel (any path, token required) -> used by the local client.
+ *      Optional obfuscation per connection: plain | pad | full
+ *   2. HTTP CONNECT + HTTP forward proxy (Render's edge usually rejects CONNECT,
+ *      kept for hosts that allow it)
  *
- * Safety / resource controls:
- *   - TOKEN required for everything except /health, /ip, /echo
+ * Resource / safety controls:
+ *   - TOKEN required for everything except /health, /ip, /echo and the decoy page
  *   - Hard session cap (MAX_SESSION_HOURS) and idle cap (IDLE_MINUTES)
- *   - Private/internal addresses are blocked (no SSRF into Render's network)
- *   - SMTP ports blocked (no spam relay)
+ *   - Private/internal addresses blocked; SMTP ports blocked
+ *   - Unauthenticated probes see an ordinary-looking website / 404, not "401"
  */
 const http = require('http');
 const net = require('net');
@@ -25,6 +25,7 @@ const TOKEN = process.env.TOKEN;
 const LABEL = process.env.REGION_LABEL || process.env.RENDER_SERVICE_NAME || 'tunnel';
 const MAX_MS = (Number(process.env.MAX_SESSION_HOURS) || 3) * 3600e3;
 const IDLE_MS = (Number(process.env.IDLE_MINUTES) || 20) * 60e3;
+const VERBOSE = process.env.VERBOSE === '1'; // log destination hostnames in /logs
 const BLOCKED_PORTS = new Set([25, 465, 587]);
 
 if (!TOKEN || TOKEN.length < 12) {
@@ -32,11 +33,17 @@ if (!TOKEN || TOKEN.length < 12) {
   process.exit(1);
 }
 
-const tunnels = new Set(); // objects with .destroy()
+const tunnels = new Set();
 let session = null; // { start, last }
 let bytes = 0;
+const events = [];
 
-const log = (...a) => console.log(new Date().toISOString(), ...a);
+function ev(type, info = '') {
+  const e = { t: new Date().toISOString(), type, info };
+  events.push(e);
+  if (events.length > 200) events.shift();
+  console.log(e.t, type, info);
+}
 
 // ---------- auth ----------
 function safeEq(a, b) {
@@ -52,8 +59,9 @@ function basicOk(h) {
 function bearerOk(req, url) {
   const h = req.headers.authorization || '';
   if (h.startsWith('Bearer ') && safeEq(h.slice(7), TOKEN)) return true;
-  return url && safeEq(url.searchParams.get('token') || '', TOKEN);
+  return !!url && safeEq(url.searchParams.get('token') || '', TOKEN);
 }
+const clientIp = (req) => (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
 
 // ---------- session limits ----------
 function allowed() {
@@ -73,12 +81,10 @@ setInterval(() => {
   if (!session) return;
   const now = Date.now();
   if (now - session.start > MAX_MS) {
-    log('max session reached; closing tunnels');
+    ev('limit', 'max session reached; closing tunnels');
     killAll();
-  } else if (now - session.last > IDLE_MS && tunnels.size === 0) {
-    session = null;
   } else if (now - session.last > IDLE_MS) {
-    log('idle; closing tunnels');
+    if (tunnels.size) ev('limit', 'idle; closing tunnels');
     killAll();
     session = null;
   }
@@ -89,7 +95,7 @@ function isPrivate(ip) {
   if (net.isIPv6(ip)) {
     const l = ip.toLowerCase();
     if (l === '::1' || l === '::') return true;
-    if (l.startsWith('fc') || l.startsWith('fd') || l.startsWith('fe8') || l.startsWith('fe9') || l.startsWith('fea') || l.startsWith('feb')) return true;
+    if (/^(fc|fd|fe[89ab])/.test(l)) return true;
     const m = l.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
     return m ? isPrivate(m[1]) : false;
   }
@@ -106,8 +112,8 @@ async function resolveSafe(host, port) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('bad port');
   if (BLOCKED_PORTS.has(port)) throw new Error('port blocked');
   const { address } = await dns.lookup(host);
-  if (isPrivate(address)) throw new Error('private address blocked');
-  return address; // connect by IP: no DNS-rebinding window
+  if (isPrivate(address) && process.env.ALLOW_PRIVATE !== '1') throw new Error('private address blocked'); // ALLOW_PRIVATE=1 is for local testing only
+  return address;
 }
 function splitHostPort(s, defPort) {
   let host = s, port = defPort;
@@ -135,10 +141,49 @@ function deny407(sock) {
   sock.end('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="tunnel"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
 }
 
-// ---------- HTTP server ----------
+// ---------- frame codec (must match client/local-client.js) ----------
+// plain : raw bytes in each WebSocket message
+// pad   : [u16 len][payload][random padding 0-96]
+// full  : same, padding 0-255, random chunk sizes, decoy frames
+const rnd = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+function makeCodec(obfs) {
+  if (obfs !== 'pad' && obfs !== 'full') return { full: false, enc: (b) => [b], dec: (b) => b, decoy: () => null };
+  const full = obfs === 'full';
+  const padMax = full ? 255 : 96;
+  const nextChunk = full ? () => rnd(400, 16000) : () => 60000;
+  const frame = (p, padLen) => {
+    const pl = padLen === undefined ? rnd(0, padMax) : padLen;
+    const f = Buffer.alloc(2 + p.length + pl);
+    f.writeUInt16BE(p.length, 0);
+    p.copy(f, 2);
+    crypto.randomFillSync(f, 2 + p.length);
+    return f;
+  };
+  return {
+    full,
+    enc(b) {
+      const out = [];
+      for (let i = 0; i < b.length;) {
+        const n = Math.min(b.length - i, nextChunk());
+        out.push(frame(b.subarray(i, i + n)));
+        i += n;
+      }
+      return out;
+    },
+    dec(b) {
+      if (b.length < 2) return null;
+      const n = b.readUInt16BE(0);
+      return n ? b.subarray(2, 2 + n) : null;
+    },
+    decoy: () => frame(Buffer.alloc(0), rnd(60, 500)),
+  };
+}
+
+// ---------- HTTP ----------
+const DECOY = '<!doctype html><html><head><meta charset="utf-8"><title>Welcome</title></head><body style="font-family:sans-serif;max-width:40em;margin:3em auto"><h1>Welcome</h1><p>Site under construction.</p></body></html>';
+
 const server = http.createServer(async (req, res) => {
-  // Forward-proxy request for plain http:// sites
-  if (/^https?:\/\//i.test(req.url)) {
+  if (/^https?:\/\//i.test(req.url)) { // plain HTTP forward proxy
     if (!basicOk(req.headers['proxy-authorization'])) {
       res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="tunnel"' });
       return res.end();
@@ -171,38 +216,45 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(obj));
   };
 
-  if (url.pathname === '/health') {
-    return json(200, { ok: true, label: LABEL, uptime: Math.round(process.uptime()), tunnels: tunnels.size });
-  }
-  if (url.pathname === '/ip') {
-    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-    return json(200, { ip });
-  }
-  if (url.pathname === '/echo') { // speed test payload, capped at 5 MB
+  if (url.pathname === '/health') return json(200, { ok: true, label: LABEL, uptime: Math.round(process.uptime()), tunnels: tunnels.size });
+  if (url.pathname === '/ip') return json(200, { ip: clientIp(req) });
+  if (url.pathname === '/echo') {
     const n = Math.min(Number(url.searchParams.get('size')) || 1e6, 5e6);
     res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': n, 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
     return res.end(Buffer.alloc(n));
   }
-  if (url.pathname.startsWith('/session/') || url.pathname === '/status') {
-    if (!bearerOk(req, url)) return json(401, { error: 'bad token' });
+  if (url.pathname === '/session/start' || url.pathname === '/session/stop' || url.pathname === '/status' || url.pathname === '/logs') {
+    if (!bearerOk(req, url)) {
+      ev('auth_fail', `${url.pathname} from ${clientIp(req)}`);
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      return res.end('Not Found');
+    }
     if (url.pathname === '/session/start') {
       killAll();
       session = { start: Date.now(), last: Date.now() };
+      ev('session', 'started');
       return json(200, { ok: true, maxHours: MAX_MS / 3600e3, idleMinutes: IDLE_MS / 60e3 });
     }
     if (url.pathname === '/session/stop') {
       killAll(); session = null;
+      ev('session', 'stopped');
       return json(200, { ok: true });
     }
+    if (url.pathname === '/logs') return json(200, { events });
     return json(200, {
       label: LABEL, tunnels: tunnels.size, bytes, session,
       remainingMs: session ? Math.max(0, MAX_MS - (Date.now() - session.start)) : null,
     });
   }
-  json(404, { error: 'not found' });
+  if (url.pathname === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    return res.end(DECOY);
+  }
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not Found');
 });
 
-// HTTPS tunnelling via CONNECT
+// CONNECT (kept for hosts that allow it)
 server.on('connect', async (req, sock, head) => {
   sock.on('error', () => {});
   if (!basicOk(req.headers['proxy-authorization'])) return deny407(sock);
@@ -218,35 +270,59 @@ server.on('connect', async (req, sock, head) => {
     sock.pipe(up);
     up.on('data', (d) => { bytes += d.length; touch(); });
     sock.on('data', (d) => { bytes += d.length; touch(); });
-  } catch (e) {
+  } catch {
     sock.end('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n');
   }
 });
 
-// ---------- WebSocket tunnel (for the local client) ----------
+// ---------- WebSocket tunnel (ANY path, token required) ----------
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 8 * 1024 * 1024 });
 server.on('upgrade', (req, sock, head) => {
   const url = new URL(req.url, 'http://x');
-  if (url.pathname !== '/ws' || !bearerOk(req, url) || !allowed()) {
-    sock.end('HTTP/1.1 401 Unauthorized\r\n\r\n');
+  if (!bearerOk(req, url)) {
+    ev('auth_fail', `ws ${url.pathname} from ${clientIp(req)}`);
+    sock.end('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+    return;
+  }
+  if (!allowed()) {
+    sock.end('HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
     return;
   }
   wss.handleUpgrade(req, sock, head, (ws) => {
     let up = null;
-    ws.on('message', async (data, isBinary) => {
+    let cd = makeCodec('plain');
+    let started = false;
+    const deadline = setTimeout(() => { if (!up) ws.terminate(); }, 90e3); // unused warm sockets
+    ws.on('error', () => {});
+    ws.on('close', () => clearTimeout(deadline));
+    ws.on('message', async (data) => {
       touch();
-      if (up) { bytes += data.length; return up.write(data); }
-      try { // first message: {"host":"example.com","port":443}
-        const { host, port } = JSON.parse(data.toString());
-        up = await openUpstream(String(host), Number(port));
+      if (up) {
+        const p = cd.dec(data);
+        if (p && p.length) { bytes += p.length; up.write(p); }
+        return;
+      }
+      if (started) return;
+      started = true;
+      try {
+        const m = JSON.parse(data.toString()); // {host, port, obfs, p: junk} or {probe:1}
+        cd = makeCodec(m.obfs);
+        if (m.probe) {
+          ws.send('ok');
+          setTimeout(() => ws.close(), 50);
+          return;
+        }
+        up = await openUpstream(String(m.host), Number(m.port));
         const t = { destroy: () => { up.destroy(); ws.terminate(); } };
         tunnels.add(t);
-        up.on('close', () => { tunnels.delete(t); ws.close(); });
-        up.on('error', () => ws.terminate());
-        ws.on('close', () => { tunnels.delete(t); up.destroy(); });
+        ev('open', `${m.obfs || 'plain'}${VERBOSE ? ' ' + m.host + ':' + m.port : ''}`);
+        const finish = () => { tunnels.delete(t); up.destroy(); ws.terminate(); };
+        up.on('close', finish);
+        up.on('error', finish);
+        ws.on('close', finish);
         up.on('data', (d) => {
           bytes += d.length; touch();
-          ws.send(d);
+          for (const f of cd.enc(d)) ws.send(f);
           if (ws.bufferedAmount > 4e6) {
             up.pause();
             const iv = setInterval(() => {
@@ -256,16 +332,19 @@ server.on('upgrade', (req, sock, head) => {
           }
         });
         ws.send('ok');
+        if (cd.full) { ws.send(cd.decoy()); ws.send(cd.decoy()); }
       } catch (e) {
-        ws.send('err:' + e.message);
+        ev('open_fail', e.message);
+        try { ws.send('err:' + e.message); } catch {}
         ws.close();
       }
     });
-    ws.on('error', () => {});
   });
 });
+// keep long-lived tunnels from being dropped by idle middleboxes
+setInterval(() => wss.clients.forEach((c) => { try { c.ping(); } catch {} }), 30e3).unref();
 
 server.keepAliveTimeout = 65e3;
 server.headersTimeout = 70e3;
-server.listen(PORT, '0.0.0.0', () => log(`tunnel "${LABEL}" listening on ${PORT} (max ${MAX_MS / 3600e3}h, idle ${IDLE_MS / 60e3}m)`));
-process.on('uncaughtException', (e) => log('uncaught', e.message));
+server.listen(PORT, '0.0.0.0', () => ev('start', `tunnel "${LABEL}" on ${PORT} (max ${MAX_MS / 3600e3}h, idle ${IDLE_MS / 60e3}m)`));
+process.on('uncaughtException', (e) => ev('uncaught', e.message));
